@@ -71,7 +71,7 @@ Last spring, I took a class on Bayesian statistics at the University of Chicago 
 
 This problem and solution struck me as being very similar to an issue near and dear to my heart: classifying decks into archetypes in collectible card games (CCGs). Specifically, Magic the Gathering. One could think of alleles as analogues for cards and the sub-populations as analogues for deck archetypes (UW Control, Jund, Merfolk, etc.). In this post, I will describe how to apply a Bayesian classification algorithm to this scenario and discuss some of its advantages. I assume the reader has familiarity with basic mathematical probability and statistics. I also will not show proofs for the mathematical claims that I make, but I will try to explain the intuition behind the concepts. Knowing the application area, collectible card games and Magic, will be necessary to understand the examples. 
 
-Ultimately, with very minimal data cleaning, I am able to accurately classify 86% of decks played in a testing sample. Frequently played archetypes and archetypes that share few cards with others are more accurately classified. I also describe some simple human-implementable improvements and additional features that should be included in practice. 
+Ultimately, with very minimal data cleaning, I am able to accurately classify 86% of decks played in a testing sample. Frequently played archetypes and archetypes that share few cards with others are more accurately classified. The code and data are available on [Github](https://github.com/g-tierney/magic_deck_classification_multi_dir). I also describe some simple human-implementable improvements and additional features that should be included in practice. 
 
 ## The Problem
 
@@ -134,7 +134,7 @@ After computing each of these, standardize them to sum to one and you have the p
 
 ## Results
 
-Available on Github is R code that implements the above method, allowing for a flexible specification of $\alpha$ in the prior. I chose $\alpha=1$ because it represents starting from a uniform distribution, but the choice of prior is certainly open for debate. I also show the results for $\alpha=0$, which corresponds to the initial maximum likelihood setup where zero frequencies are possible. 
+Available on [Github is R code](https://github.com/g-tierney/magic_deck_classification_multi_dir) that implements the above method, allowing for a flexible specification of $\alpha$ in the prior. I chose $\alpha=1$ because it represents starting from a uniform distribution, but the choice of prior is certainly open for debate. I also show the results for $\alpha=0$, which corresponds to the initial maximum likelihood setup where zero frequencies are possible. 
 
 The results for $\alpha$ equal to 0, 1, and 0.01 are reported below. $\alpha$ of 0.01 corresponds to a prior with a smaller effect on the posterior (each $\alpha_c$ will be $0.01 + n_{c,i}$) and frequencies closer to zero are more likely. Correct is the number of correct classifications, Size is the number of decks classified, and Rate is the ratio of those two. The Confident columns subset the results to classifications were the posterior probability of the suggested classification is greater than 95%. 
 
