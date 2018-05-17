@@ -1,4 +1,4 @@
-# magic_deck_classification_multi_dir
+# The Genetics of Magic
 
 This repository contains the code described in my blog post here: https://g-tierney.github.io/post/magic_classification/. I apply a genetic classification algorithm to a collectible card game. Decks are classified into broader archetypes by treating card frequencies like allele frequencies in the genetics problem. 
 
