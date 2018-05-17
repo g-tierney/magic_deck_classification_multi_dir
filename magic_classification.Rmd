@@ -1,0 +1,213 @@
+---
+title: "The Genetics of Magic"
+author: "Graham Tierney"
+date: 2018-05-10
+categories: ["Data Analysis"]
+tags: ["Bayesian", "Classification", "Genetics"]
+summary: "An application of genetic classification algorithms to collectible card games."
+output: html_document
+---
+
+```{r options, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(data.table)
+library(knitr)
+library(tidyverse)
+library(kableExtra)
+options(digits = 2)
+```
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#test load
+project_dir <- ""
+
+#load all data in scraping_pages folder
+files <- list.files(path = str_c(project_dir,"data/scraping_pages"),pattern = "csv$",recursive = T)
+data <- lapply(str_c(project_dir,"data/scraping_pages/",files),fread,stringsAsFactors = T,fill=T)
+data <- rbindlist(data,fill = T)
+data <- data[!duplicated(data)] #drop exact duplicates
+data <- data[type != "Sideboard"]
+
+
+#correct deck names 
+data[deck_id %in% c(371116,371143),Deck := "Colorless Eldrazi"]
+data[Deck == "Afinity",Deck := "Affinity"]
+data[,Deck := str_replace_all(Deck,"/","") %>% str_to_title() %>% str_replace_all("&","And")%>% as.factor()]
+#make unique identifier
+data[,deck_id_full := str_c(deck_id,"_",Date,"_",Name) %>% as.factor()]
+
+#only use SCG events
+#data <- data[grep("scg",data$url_name,value = F)]
+data <- droplevels(data) 
+setkey(data,deck_id_full)
+
+#subset to use for testing
+set.seed(1234)
+test_full <- data %>% group_by(deck_id,Deck) %>% nest(card,number) 
+sample_subset <- sample(1:nrow(test_full),size = 300,replace=F)
+test_sample <- test_full[sample_subset,]
+data_train <- data[-which(deck_id %in% test_sample$deck_id),]
+
+cards <- levels(data$card)
+decks <- sort(levels(data$Deck))
+
+source(str_c(project_dir,"functions.R"))
+
+```
+
+```{r classify_decks,include=F, cache=TRUE}
+result_sample_alpha1 <- classify_sample(test_sample,data_train,alpha=1)
+result_sample_alpha.01 <- classify_sample(test_sample,data_train,alpha=0.01)
+result_sample_alpha0 <- classify_sample(test_sample,data_train,alpha=0)
+
+```
+
+## Introduction
+
+Last spring, I took a class on Bayesian statistics at the University of Chicago that had several exercises focused on building a model to classify species based on their genome. The basic setup was that you were given a data set of salmon, their genome sequencing data, and which sub-population they belonged to. From this data, we needed to build a model to classify new salmon into the sub-populations. The strategy was to use the fact that alleles appeared with different frequencies in the different sub-populations, so the fact that a new fish did have certain alleles and did not have others was informative about which sub-population it came from. 
+
+This problem and solution struck me as being very similar to an issue near and dear to my heart: classifying decks into archetypes in collectible card games (CCGs). Specifically, Magic the Gathering. One could think of alleles as analogues for cards and the sub-populations as analogues for deck archetypes (UW Control, Jund, Merfolk, etc.). In this post, I will describe how to apply a Bayesian classification algorithm to this scenario and discuss some of its advantages. I assume the reader has familiarity with basic mathematical probability and statistics. I also will not show proofs for the mathematical claims that I make, but I will try to explain the intuition behind the concepts. Knowing the application area, collectible card games and Magic, will be necessary to understand the examples. 
+
+Ultimately, with very minimal data cleaning, I am able to accurately classify 86% of decks played in a testing sample. Frequently played archetypes and archetypes that share few cards with others are more accurately classified. I also describe some simple human-implementable improvements and additional features that should be included in practice. 
+
+## The Problem
+
+Magic, and collectible card games broadly, are usually two-player games where each player brings their own deck of different cards. Many tournament-caliber decks are categorized into broader archetypes that differ only slightly. For example, Merfolk is a deck that plays creature cards with the Merfolk creature type and "lords" that give bonuses to all Merfolk cards. Not all Merfolk decks are identical, but a human who knows the game well can easily look at a deck-list and say if it is a Merfolk deck or not. Jund is a deck that plays green, black, and red cards that focus on trading resources with the opponent while eking out small advantages in each exchange. The variety of cards played in Jund is significantly higher than the variety of cards played in Merfolk decks. 
+
+Classifying a single deck into an archetype is an easy task for a human who knows the game well, but frequently this classification has to be done at scale. Large tournaments happen every weekend, thousands of matches are played online every day, and it would take an extremely large team to classify all of those decks. A classification algorithm would ideally give a data-driven, suggested archetype and express how uncertain it was about that suggestion. 
+
+I know of two types of practitioners who face this problem. First are the companies that make collectible card games. They are often interested in assessing whether there is a sufficiently diverse array of successful archetypes, which requires efficiently classifying decks then calculating things like play- and win-rates by archetype. The developers can then either ban or change existing cards to improve the format. Second are third-party websites. They often provide "meta-game reports" that cover which archetypes are successful or likely to become successful. For them, the value of archetype statistics is simply to report them to players who have to decide which deck to bring to a tournament. 
+
+## The Data
+
+The method I will describe relies on having a lot of decks with known archetypes. I will use data from [MTG Goldfish](https://www.mtggoldfish.com/) on Modern decks played in Star City Games (SCG) events from 2014 to the present. Modern is a non-rotating format, which means that cards from older sets will always be legal in the format. In a rotating format like Standard, where only cards from sets released in the past two years are legal, data on older decks is not useful to classify newer decks. Additionally, the names of deck archetypes at Star City Games events are more standardized than the weekly data from Magic Online (MTGO), the digital version of the game. The algorithm could be used in these other scenarios with enough data, but deck-lists are only released for top finishers at SCG events and on MTGO. 
+
+Over the `r length(unique(paste0(data$Name,data$Date)))` tournaments, I observe `r format(length(levels(data$deck_id_full)),big.mark=",")` unique decks, `r length(levels(data$Deck))` unique deck archetypes, and `r format(length(levels(data$card)),big.mark=",")` unique cards. I will separate a 300 deck sample to use for testing after constructing the model. 
+
+## The Method
+
+I'll start by defining some notation. $D_{new}$ is a new deck that needs to be classified into an archetype. It is a list of card names and card quantities. It looks like this: 
+
+```{r, echo=FALSE}
+kable(head(test_sample$data[[1]]),format = "html") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+We also have a set of training decks. The same card name and card quantity variables are included, but it also includes the true archetype name. The ultimate goal is to use the information in the training decks to classify a new deck of an unknown archetype. 
+
+### Maximum Likelihood
+
+```{r examples, include= FALSE}
+lb_j = sum(data_train$number[data_train$card == "Lightning Bolt" & data_train$Deck == "Jund"])
+j_total = sum(data_train$number[data_train$Deck == "Jund"])
+```
+
+The simplest approach to the classification problem is to use a maximum likelihood estimation. In the training set, find the frequency that each card $c$ appears among cards in archetype $i$ and treat this as the probability that a random card from archetype $i$ will be card $c$. For example, `r format(lb_j,big.mark=",")` Lightning Bolts appear among the `r format(j_total,big.mark=",")` cards in Jund decks, so this probability would be estimated as `r round(lb_j/j_total,2)`. The likelihood that $D_{new}$ came from archetype $i$ can be thought of as the probability that 60 draws with replacement from a pool of every Magic card will result in $D_{new}$ when the probability of drawing each card is given by the probabilities estimated for archetype $i$ in the training data. Formally, this is a draw of size 60 from a Multinomial distribution on the population of every Magic card and probability parameters $p_i = <p_{i,1},...,p_{i,1741}>$ where $p_{i,c}$ is the proportion of card $c$ among cards in archetype $i$. This is written below (note that $x_c$ is the number of times card $c$ appeared in $D_{new}$):  
+
+\[P(D_{new}|\text{archetype}=i) = \frac{60!}{x_1! ... x_{1741}!} \prod_{c=i}^{1741}p_{c,i}^{x_c} \propto \prod_{c=i}^{1741}p_{c,i}^{x_c} \]
+
+The most relevant part of this probability is the large product of each card frequency for each time it appears in $D_{new}$. The factorials just count the number of ways $D_{new}$ could have been drawn. However, it can be completely ignored! We will classify $D_{new}$ as whatever archetype maximizes the likelihood. The factorials are the same for every archetype, so ignoring them will not change the result. 
+
+The biggest drawback of this method is that if a card is never observed in a given archetype in the training data, the estimated likelihood that any deck containing that card is of that archetype is zero. This can be particularly problematic. A blue-white control deck that decides to use Baneslayer Angel as a finisher might have 59 cards identical to a blue-white control deck in the training set, but it will have a likelihood of zero if no training blue-white control deck contained Baneslayer Angel. 
+
+The solution to this problem is to add pseudo counts to every deck in the training set. Suppose you round every zero frequency to some small number, say 0.01. Now if a new card appears in an archetype, the likelihood will not be zero, and if the rest of the deck matches a known archetype well, it can still be correctly classified. Picking this pseudo count number can be hard. It should maybe even be different for different decks based on how many times that archetype is observed in the training set because you are likely more confident in zero frequencies for decks that you observe many times. 
+
+### Bayesian Modeling
+
+The method I propose is essentially a more rigorous way of adding these pseudo counts by putting a Bayesian prior on the frequencies. A useful distribution on a set of frequencies is the Dirichlet distribution. A draw from an n-dimensional Dirichlet distribution is a set of n positive numbers that sum to one. Note that n-1 dimensions identify the sample because the last dimension must ensure the values all sum to one. It has n parameters, call each $\alpha_c$, and the expected value for $p_c$, the frequency of card $c$, is $\alpha_c/\sum_{j=1}^n \alpha_j$. As $\alpha_c$ increases, the variance decreases. To understand this distribution, its useful to first consider the two-dimensional case, called a [Beta distribution](https://stephens999.github.io/fiveMinuteStats/beta.html). The link shows some useful visualizations of the distribution under different parameters. The Beta(1,1) distribution is uniform, Beta(5,5) has a peak at 0.5, Beta(1,4) has a peak at 0.25, Beta(0.1,0.1) has a minimum at 0.5 and has asymptotic behavior at 0 and 1. 
+
+Suppose we start with a uniform Dirichlet prior for each deck ($\alpha_c = 1$ for all $c$), essentially starting from the position that all frequency combinations are equally likely. The intuition is that the model starts from the perspective that, without any data, the probability that a random draw of a single card from an archetype $i$ is a specific card $c$ is equal to $1/n$, where $n$ is the number of unique cards (1,741 in my data). The probability that a random card from an Infect deck is Lightning Bolt is 1/1,741, the probability that a random card from a Tron deck is Urza’s Mine is 1/1,741, etc. The uncertainty about these probabilities is also the same for every card in every archetype. Of course these probabilities are wrong in practice, but they provide a sensible starting point and will be updated with data.
+
+Next, we observe the training data for each archetype, $D_t$. Assuming that each archetype has a unique set of card frequencies, using proper Bayesian updating, the posterior distribution of frequencies (the distribution conditional on the data) for each archetype is also Dirichlet with parameters $\alpha_c = 1 + n_c$, the number of times card $c$ appeared in the archetype across all decks in $D_t$. That is, starting from the prior stated above and given the training data, beliefs about the true card frequencies for each archetype are described by this distribution. To understand the intuition, after observing the training data, the probability that a single random card drawn from archetype $i$ is equal to a specific card $c$ is (1 + the number of card $c$ that appeared in archetype $i$ ($n_{c,i}$))/($n$ + the number of cards from archetype $i$ ($n_i$)). For example, Lightning Bolt was never observed in an Infect deck, so the posterior expected probability that a random card from an Infect deck is Lightning Bolt is $(1+0)/(1,741+21,607) \approx 0.00013$. Four copies of Urza's Mine were observed in every Tron deck, so the posterior expected probability that a random card from a Tron deck is Urza’s Mine is $(1+1,272)/(1,741+19,099) \approx 0.061$, which is pretty close to $4/60 = 0.0\overline{6}$. Using this method, an Infect deck splashing Lightning Bolt would not be ruled impossible, just extremely unlikely, and the model has determined that nearly every Tron deck has four Urza’s Mines. The posterior also captures differing levels of confidence in these estimations. The variance in frequencies for archetypes observed many times in $D_t$ is lower than for archetypes observed fewer times because the variance decreases as the sum of the $\alpha$ parameters increases. In other words, I am more confident in the estimation of the frequency of Urza's Mine in Tron, a heavily played deck, than I am about the frequency of Blood Moon in Skred Red decks, a rarely played deck. 
+
+Finally, when encountering a new deck, we want to compute a posterior probability that the deck came from each of the archetypes we saw in the training data. Adopting a prior that without data each archetype is equally probable implies that the likelihood alone will determine this probability. A new deck, $D_{new}$, is a collection of 60 cards defined by a vector of $x_c$'s, the number of times card $c$ appears in $D_{new}$. Our model interprets this deck as a draw of size 60 from a Multinomial-Dirichlet distribution on the set of all unique cards with Dirichlet parameters set by the posterior described above. This distribution is a Multinomial distribution where the frequency parameters are an unknown draw from a known Dirichlet distribution. So, for each archetype, the likelihood is computed as as: 
+
+\[P(\text{archetype} = i | D_{new},D_t,\alpha=1) \propto P(D_{new} | \text{archetype} = i,D_t,\alpha=1) = \]
+\[f(D_{new};\text{size} = 60,\alpha_c = 1+n_{c,i}) = \frac{(60!) \Gamma(\sum_{c=1}^{1741} \alpha_c)}{\Gamma(60 + \sum_{c=1}^{1741} \alpha_c)} \prod_{c=1}^{1741} \frac{x_c + \alpha_c}{(x_c!) \Gamma(\alpha_c)} \] 
+
+Where $f(x)$ is the pmf of the Multinomial-Dirichlet distribution and $\Gamma$ is the gamma function, which is very similar to a factorial that can be applied non-integers. This function does look a lot more complicated than the simple likelihood before. That is because it is accounting for the uncertainty in the frequencies. You could simplify this function by using just the expectation of each frequency for each deck ($\alpha_c$ divided by the sum of the $\alpha_c$'s). That likelihood would look like the simple likelihood described previously where you can ignore the factorial constant and just take the product of each expected probability exponentiated by $x_c$. It would solve the problem of zero frequency cards. However, you would lose information about how confident you were in each expectation. The estimated frequencies of an archetype only observed twice in $D_t$ should be viewed with more suspicion than the frequencies for one observed 500 times. That is the reason the gamma functions outside of the product cannot be ignored in this likelihood. 
+
+After computing each of these, standardize them to sum to one and you have the probability that the new deck came from each of the observed archetypes. Classify it into whichever archetype has the highest probability and you’re done! 
+
+## Results
+
+Available on Github is R code that implements the above method, allowing for a flexible specification of $\alpha$ in the prior. I chose $\alpha=1$ because it represents starting from a uniform distribution, but the choice of prior is certainly open for debate. I also show the results for $\alpha=0$, which corresponds to the initial maximum likelihood setup where zero frequencies are possible. 
+
+The results for $\alpha$ equal to 0, 1, and 0.01 are reported below. $\alpha$ of 0.01 corresponds to a prior with a smaller effect on the posterior (each $\alpha_c$ will be $0.01 + n_{c,i}$) and frequencies closer to zero are more likely. Correct is the number of correct classifications, Size is the number of decks classified, and Rate is the ratio of those two. The Confident columns subset the results to classifications were the posterior probability of the suggested classification is greater than 95%. 
+
+```{r raw_results, echo=FALSE}
+ra0 <- print_accuracy(result_sample_alpha0,.95,F)
+ra1 <- print_accuracy(result_sample_alpha1,.95,F)
+ra.01 <- print_accuracy(result_sample_alpha.01,.95,F)
+comparison <- cbind(data.frame(Alpha = c(0,.01,1)),rbind(round(ra0,2),round(ra.01,2),round(ra1,2)))
+
+comparison <- comparison %>% rename(`Correct (Confident)` = correct_confident,
+                                    `Size (Confident)` = size_confident,
+                                    `Rate (Confident)` = rate_confident)
+kable(comparison,format = "html",align='c') %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+The value of $\alpha=1$ appears to be the most accurate, getting 86% of classifications correct, but the smaller $\alpha$ is not very different. It is also worth noting that the method appears to be too confident in its classifications. One would hope the accuracy rate would be similar to the estimated probability, but it appears that the classifications made with at least 95% probability have an accuracy rate well below that number. 
+
+I will look at the accuracy rate by archetype as well. The table below shows the five most frequent and five least frequent archetypes observed in the testing data. Total is the number of times the archetype appears, Proportion Correct is the proportion of those decks that are correctly classified, and Mode Incorrect is the most common incorrect classification (missing values indicate that all decks are correctly classified). 
+
+```{r, include=FALSE}
+#this has some warning messages I don't want included in the markdown file
+result_by_deck_alpha1 <- accuracy_by_deck(result_sample_alpha1) %>% arrange(desc(total))
+```
+
+```{r, echo=F}
+result_by_deck_alpha1 <- result_by_deck_alpha1 %>% 
+  mutate(mode_incorrect = if_else(is.na(mode_incorrect), "", mode_incorrect),
+         prop_correct = round(prop_correct,2)) %>% 
+  rename(Total = total,`Proportion Correct` = prop_correct,`Mode Incorrect` = mode_incorrect)
+rows <- nrow(result_by_deck_alpha1)
+kable(result_by_deck_alpha1[c(1:5,(rows-4):rows),1:4],format = "html",align='lccl') %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+Affinity and Infect are very unique decks, so it is not surprising that the algorithm correctly classifies them. Jund is very similar to many other black green midrange decks, so I was surprised they were all correctly identified. That could be because Jund is a very common archetype in the training decks, so the algorithm has enough data to separate Jund from similar decks. Naya Burn was most frequently miss classified as normal Burn, which is not very surprising. 
+
+Among the least frequent archetypes, the mistakes are not unexpected. Its possible that WG Hatebears and GW Hatebears should be the same archetype anyway, and the Wilt-Leaf Abzan deck is just a special subset of Abzan decks that play the card Wilt-Leaf Liege. 
+
+## Human Improvements
+
+I think a lot of the time, people want their statistical model to work without any human input. However, human-level tweaks often provide significantly greater performance improvements than tweaks to the statistical methods. Three areas where an analyst with domain knowledge could improve the method are outlined below. 
+
+First, standardizing deck archetypes. I made a few changes to these but wanted to leave the data mostly raw. For example, I made “U/R Twin” and “UR Twin” the same deck, changed “Death & Taxes” to “Death And Taxes”, and standardized capitalization. Several remaining archetypes, however, should probably be grouped together. Some low hanging fruit are probably the 38 “Naya Through the Breach” decks and the 21 “Naya Titan Breach” decks, and the 88 “UB Tezzerator” and 26 “UB Tezzeret” decks. These kind of changes could be made incrementally as more data are added by standardizing the names of new decks and by someone who was unfamiliar with the code and statistics, but was familiar with the Modern format.  
+
+Another area an analyst could improve these results is by selectively including true zeros in the likelihood. For example, Abzan compared to Abzan Company decks differ by whether the card Collected Company is included in the list. With enough data, the algorithm will learn this distinction, but that identification could be expedited and accuracy increased if the Abzan likelihood function had a zero frequency for Collected Company. A similar method could be used to separate similar archetypes defined by color splashes, such as distinguishing Jeskai Twin, Grixis Twin, and UR Twin by including zeros for lands by which color they produce. 
+
+A third and final area more domain knowledge could help is manually reviewing low probability classifications. Let’s look at the most uncertain classifications. These six decks are the ones the algorithm had the most uncertainty about. An analyst could review the burn decks to separate which was Naya Burn and which was normal Burn (or potentially just combine those archetypes) and correctly identify color of the Eldrazi list. 
+
+```{r,echo=F}
+
+kable(head(result_sample_alpha1 %>% arrange(max_prob) %>% select(Deck,best_guess,max_prob,correct) %>% 
+             rename(`Classification` = best_guess,`Probability Correct` = max_prob,`Correct` = correct)),
+      format = "html",align = 'llcl') %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+## Implementation in Practice
+
+A company or data scientist building this tool for frequent use in an analysis pipeline would want to design a few features beyond the one-time estimation and classification described here. 
+
+Training data updating. CCGs evolve over time with new card releases and novel combinations discovered by players. When a new archetype is formed, examples of it need to be added to the training data. To that end, and to update old archetypes with new cards, samples of decks should be regularly classified by humans and added to the training data, with special emphasis placed on getting sufficient samples of new archetypes. It would also be wise to sample more heavily from decks with low probability classifications and track accuracy rates of the new training decks.  
+
+Archetype hierarchies. Many of the incorrect classifications were from mistaking sub-archetypes, such as confusing Naya Burn for Burn or Wilt-Leaf Abzan for Abzan. A two-stage classification could be more accurate and better address the questions practitioners are asking. An analyst would place some archetypes into categories, all Burn decks into one category and all Abzan into another. The algorithm would be implemented twice. Once to place a deck into a category then again to place the deck within that category. The higher-level category will probably be more accurate and sufficient for most practitioners' purposes. 
+
+Prior selection. The uniform prior of $\alpha = 1$ is useful for interpretation, but practitioners may find it to be less accurate for archetypes with small sample sizes. Selecting the $\alpha$ that maximizes the accuracy rate in the training data is one simple option, or a cross-validation method could pick $\alpha$ to maximize the accuracy rate across many samples. 
+
+Incorporating game-specific features. Every CCG has unique deck-building rules, which could be built into the likelihood function. Magic decks cannot contain more than four of a single card and no fewer than 60 total cards, so frequencies greater than 4/60 are impossible. In Hearthstone, the cap is two for some cards, one for others, and decks must be exactly 30 cards. Deck size is already included as a parameter in the Multinomial-Dirichlet distribution, but card limits are not. Two alternatives I tried were treating each deck as a series of Bernoulli random variables indicating whether a card was present or not in a deck and treating a deck as a draw from several Multinomial distributions of size 4 (or the appropriate card limit). They were not as accurate as the method described here, but potentially could be improved. At the least, they are worth experimenting with on new data sets. 
+
+## Machine Learning Methods
+
+I am certain that there are machine learning methods that address this problem as well. Classification is a well-studied topic in machine learning and this classification problem does not present too many unique challenges. However, I think this Bayesian approach has certain advantages in model updating and uncertainty quantification. It is quite easy to update the model with new, correctly-labeled decks. Simply add the new card counts the appropriate archetype in the training data. Many ML methods would need to re-calibrate tuning and regularization parameters with new training data, which could be quite time consuming. The second advantage is uncertainty quantification. Given the prior, this model explicitly reports the probability that the classification is correct. This is useful in flagging cases for manual review, as noted above. 
+
+## Conclusion
+
+While not perfect, this algorithm should become quite adept at identifying archetypes with enough data. In formats without much turnover in the top decks, collecting the amount of data required is not very difficult. In rotating formats, however, it could be much harder. The people interested in this kind of application, however, might have more than just the top decks from weekend tournaments. Wizards of the Coast, the company that makes Magic, can observe every game played on Magic Online, tournament organizers collect deck lists from every player, and Vicious Syndicate has a popular deck tracking app for Hearthstone. They can certainly collect enough samples of decks, and perhaps the method described here could improve their classification accuracy or reduce the human labor required. 
